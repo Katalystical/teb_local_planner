@@ -687,8 +687,8 @@ void TebOptimalPlanner::AddEdgesViaPoints()
   {
     
     int index = teb_.findClosestTrajectoryPose(*vp_it, NULL, start_pose_idx);
-    if (cfg_->trajectory.via_points_ordered)
-      start_pose_idx = index+2; // skip a point to have a DOF inbetween for further via-points
+    if (index < 0)
+      break;
      
     // check if point conicides with goal or is located behind it
     if ( index > n-2 ) 
@@ -706,6 +706,8 @@ void TebOptimalPlanner::AddEdgesViaPoints()
         continue; // skip via points really close or behind the current robot pose
       }
     }
+    if (cfg_->trajectory.via_points_ordered)
+      start_pose_idx = index+2; // skip a point to have a DOF inbetween for further via-points
     Eigen::Matrix<double,1,1> information;
     information.fill(cfg_->optim.weight_viapoint);
     
@@ -1267,6 +1269,8 @@ bool TebOptimalPlanner::isTrajectoryFeasible(base_local_planner::CostmapModel* c
   {           
     if ( costmap_model->footprintCost(teb().Pose(i).x(), teb().Pose(i).y(), teb().Pose(i).theta(), footprint_spec, inscribed_radius, circumscribed_radius) == -1 )
     {
+      ROS_WARN_THROTTLE(1.0, "TEB feasibility: footprint collides at trajectory pose %d/%d (x=%.2f, y=%.2f, yaw=%.2f)",
+                        i, look_ahead_idx, teb().Pose(i).x(), teb().Pose(i).y(), teb().Pose(i).theta());
       if (visualization_)
       {
         visualization_->publishInfeasibleRobotPose(teb().Pose(i), *cfg_->robot_model, footprint_spec);
@@ -1294,6 +1298,8 @@ bool TebOptimalPlanner::isTrajectoryFeasible(base_local_planner::CostmapModel* c
           if ( costmap_model->footprintCost(intermediate_pose.x(), intermediate_pose.y(), intermediate_pose.theta(),
             footprint_spec, inscribed_radius, circumscribed_radius) == -1 )
           {
+            ROS_WARN_THROTTLE(1.0, "TEB feasibility: interpolated footprint collides between poses %d and %d (x=%.2f, y=%.2f, yaw=%.2f)",
+                              i, i + 1, intermediate_pose.x(), intermediate_pose.y(), intermediate_pose.theta());
             if (visualization_) 
             {
               visualization_->publishInfeasibleRobotPose(intermediate_pose, *cfg_->robot_model, footprint_spec);

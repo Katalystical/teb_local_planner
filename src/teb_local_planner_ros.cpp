@@ -42,6 +42,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
 #include <boost/algorithm/string.hpp>
+#include <cmath>
 
 // MBF return codes
 #include <mbf_msgs/ExePathResult.h>
@@ -67,6 +68,7 @@ namespace teb_local_planner
   
 
 TebLocalPlannerROS::TebLocalPlannerROS() : costmap_ros_(NULL), tf_(NULL), costmap_model_(NULL),
+                                           ordered_plan_tracking_(false), max_plan_heading_change_(0.0), global_plan_start_idx_(0),
                                            costmap_converter_loader_("costmap_converter", "costmap_converter::BaseCostmapToPolygons"),
                                            dynamic_recfg_(NULL), custom_via_points_active_(false), goal_reached_(false), no_infeasible_plans_(0),
                                            last_preferred_rotdir_(RotType::none), initialized_(false)
@@ -101,6 +103,13 @@ void TebLocalPlannerROS::initialize(std::string name, tf2_ros::Buffer* tf, costm
 	        
     // get parameters of TebConfig via the nodehandle and override the default config
     cfg_.loadRosParamFromNodeHandle(nh);       
+    nh.param("ordered_plan_tracking", ordered_plan_tracking_, false);
+    nh.param("max_plan_heading_change", max_plan_heading_change_, 0.0);
+    if (max_plan_heading_change_ < 0.0 || max_plan_heading_change_ > M_PI)
+    {
+      ROS_ERROR("TebLocalPlannerROS: max_plan_heading_change must be between 0 and pi radians; disabling it.");
+      max_plan_heading_change_ = 0.0;
+    }
     
     // reserve some memory for obstacles
     obstacles_.reserve(500);
@@ -212,6 +221,7 @@ bool TebLocalPlannerROS::setPlan(const std::vector<geometry_msgs::PoseStamped>& 
   // store the global plan
   global_plan_.clear();
   global_plan_ = orig_global_plan;
+  global_plan_start_idx_ = 0;
 
   // we do not clear the local planner here, since setPlan is called frequently whenever the global planner updates the plan.
   // the local planner checks whether it is required to reinitialize the trajectory or not within each velocity computation step.  
@@ -266,19 +276,25 @@ uint32_t TebLocalPlannerROS::computeVelocityCommands(const geometry_msgs::PoseSt
   robot_vel_.angular.z = tf2::getYaw(robot_vel_tf.pose.orientation);
   
   // prune global plan to cut off parts of the past (spatially before the robot)
-  pruneGlobalPlan(*tf_, robot_pose, global_plan_, cfg_.trajectory.global_plan_prune_distance);
+  if (!ordered_plan_tracking_)
+    pruneGlobalPlan(*tf_, robot_pose, global_plan_, cfg_.trajectory.global_plan_prune_distance);
 
   // Transform global plan to the frame of interest (w.r.t. the local costmap)
   std::vector<geometry_msgs::PoseStamped> transformed_plan;
   int goal_idx;
+  int start_idx = global_plan_start_idx_;
   geometry_msgs::TransformStamped tf_plan_to_global;
   if (!transformGlobalPlan(*tf_, global_plan_, robot_pose, *costmap_, global_frame_, cfg_.trajectory.max_global_plan_lookahead_dist, 
-                           transformed_plan, &goal_idx, &tf_plan_to_global))
+                           transformed_plan, &goal_idx, &tf_plan_to_global,
+                           ordered_plan_tracking_ ? global_plan_start_idx_ : -1,
+                           ordered_plan_tracking_ ? max_plan_heading_change_ : 0.0, &start_idx))
   {
     ROS_WARN("Could not transform the global plan to the frame of the controller");
     message = "Could not transform the global plan to the frame of the controller";
     return mbf_msgs::ExePathResult::INTERNAL_ERROR;
   }
+  if (ordered_plan_tracking_)
+    global_plan_start_idx_ = start_idx;
 
   // update via-points container
   if (!custom_via_points_active_)
@@ -305,6 +321,8 @@ uint32_t TebLocalPlannerROS::computeVelocityCommands(const geometry_msgs::PoseSt
 
   // check if we should enter any backup mode and apply settings
   configureBackupModes(transformed_plan, goal_idx);
+  if (!custom_via_points_active_)
+    updateViaPointsContainer(transformed_plan, cfg_.trajectory.global_plan_viapoint_sep);
   
     
   // Return false if the transformed global plan is empty
@@ -322,6 +340,17 @@ uint32_t TebLocalPlannerROS::computeVelocityCommands(const geometry_msgs::PoseSt
   if (cfg_.trajectory.global_plan_overwrite_orientation)
   {
     robot_goal_.theta() = estimateLocalGoalOrientation(global_plan_, transformed_plan.back(), goal_idx, tf_plan_to_global);
+    if (ordered_plan_tracking_ && goal_idx >= 0 && goal_idx + 1 < static_cast<int>(global_plan_.size()))
+    {
+      if (cfg_.robot.is_footprint_dynamic)
+      {
+        footprint_spec_ = costmap_ros_->getRobotFootprint();
+        costmap_2d::calculateMinAndMaxDistances(footprint_spec_, robot_inscribed_radius_, robot_circumscribed_radius);
+      }
+      if (adjustLocalGoalOrientation(*costmap_model_, footprint_spec_, transformed_plan.back().pose.position,
+                                     robot_goal_.theta(), robot_inscribed_radius_, robot_circumscribed_radius))
+        ROS_WARN_THROTTLE(10.0, "TEB: adjusted an intermediate goal heading to avoid a footprint collision");
+    }
     // overwrite/update goal orientation of the transformed plan with the actual goal (enable using the plan as initialization)
     tf2::Quaternion q;
     q.setRPY(0, 0, robot_goal_.theta());
@@ -700,11 +729,10 @@ bool TebLocalPlannerROS::pruneGlobalPlan(const tf2_ros::Buffer& tf, const geomet
 
 bool TebLocalPlannerROS::transformGlobalPlan(const tf2_ros::Buffer& tf, const std::vector<geometry_msgs::PoseStamped>& global_plan,
                   const geometry_msgs::PoseStamped& global_pose, const costmap_2d::Costmap2D& costmap, const std::string& global_frame, double max_plan_length,
-                  std::vector<geometry_msgs::PoseStamped>& transformed_plan, int* current_goal_idx, geometry_msgs::TransformStamped* tf_plan_to_global) const
+                  std::vector<geometry_msgs::PoseStamped>& transformed_plan, int* current_goal_idx, geometry_msgs::TransformStamped* tf_plan_to_global,
+                  int first_plan_idx, double max_heading_change, int* current_start_idx) const
 {
   // this method is a slightly modified version of base_local_planner/goal_functions.h
-
-  const geometry_msgs::PoseStamped& plan_pose = global_plan[0];
 
   transformed_plan.clear();
 
@@ -713,9 +741,11 @@ bool TebLocalPlannerROS::transformGlobalPlan(const tf2_ros::Buffer& tf, const st
     if (global_plan.empty())
     {
       ROS_ERROR("Received plan with zero length");
-      *current_goal_idx = 0;
+      if (current_goal_idx) *current_goal_idx = 0;
       return false;
     }
+
+    const geometry_msgs::PoseStamped& plan_pose = global_plan.front();
 
     // get plan_to_global_transform from plan frame to global_frame
     geometry_msgs::TransformStamped plan_to_global_transform = tf.lookupTransform(global_frame, ros::Time(), plan_pose.header.frame_id, plan_pose.header.stamp,
@@ -732,37 +762,123 @@ bool TebLocalPlannerROS::transformGlobalPlan(const tf2_ros::Buffer& tf, const st
                            // located on the border of the local costmap
     
 
-    int i = 0;
+    if (first_plan_idx >= static_cast<int>(global_plan.size()))
+    {
+      ROS_ERROR("Ordered global plan start index is outside the plan");
+      return false;
+    }
+    int i = std::max(first_plan_idx, 0);
     double sq_dist_threshold = dist_threshold * dist_threshold;
     double sq_dist = 1e10;
     
     //we need to loop to a point on the plan that is within a certain distance of the robot
     bool robot_reached = false;
-    for(int j=0; j < (int)global_plan.size(); ++j)
+    for(int j=i; j < (int)global_plan.size(); ++j)
     {
       double x_diff = robot_pose.pose.position.x - global_plan[j].pose.position.x;
       double y_diff = robot_pose.pose.position.y - global_plan[j].pose.position.y;
       double new_sq_dist = x_diff * x_diff + y_diff * y_diff;
 
-      if (robot_reached && new_sq_dist > sq_dist)
+      if ((first_plan_idx >= 0 || robot_reached) && new_sq_dist > sq_dist)
         break;
 
       if (new_sq_dist < sq_dist) // find closest distance
       {
         sq_dist = new_sq_dist;
         i = j;
-        if (sq_dist < 0.05)      // 2.5 cm to the robot; take the immediate local minima; if it's not the global
-          robot_reached = true;  // minima, probably means that there's a loop in the path, and so we prefer this
+        if (sq_dist < 0.05)      // squared distance; prefer the first local minimum within approximately 22 cm
+          robot_reached = true;
       }
+    }
+    if (first_plan_idx >= 0)
+    {
+      // The robot may cut inside a corner, leaving a waypoint farther away
+      // than the following path. Bound the search along the path to avoid
+      // jumping to a nearby pass.
+      constexpr double corner_lookahead = 0.2;
+      double path_distance = 0.0;
+      for (int j = i + 1; j < static_cast<int>(global_plan.size()); ++j)
+      {
+        const auto& from = global_plan[j - 1].pose.position;
+        const auto& to = global_plan[j].pose.position;
+        path_distance += std::hypot(to.x - from.x, to.y - from.y);
+        if (path_distance > corner_lookahead)
+          break;
+        const double dx = robot_pose.pose.position.x - to.x;
+        const double dy = robot_pose.pose.position.y - to.y;
+        const double candidate_sq_dist = dx * dx + dy * dy;
+        if (candidate_sq_dist < sq_dist)
+        {
+          i = j;
+          sq_dist = candidate_sq_dist;
+          break;
+        }
+      }
+    }
+    if (current_start_idx) *current_start_idx = i;
+
+    // Look farther through an upcoming bend so TEB can shape its trajectory
+    // before reaching the corner. Straight sections retain the configured horizon.
+    if (max_plan_length > 0)
+    {
+      constexpr double bend_probe_distance = 1.0;
+      constexpr double bend_heading_change = 0.35;
+      constexpr double bend_lookahead_distance = 2.0;
+      double probe_length = 0.0;
+      double accumulated_heading_change = 0.0;
+      double previous_heading = 0.0;
+      bool have_previous_heading = false;
+
+      for (int j = i + 1; j < static_cast<int>(global_plan.size()) && probe_length < bend_probe_distance; ++j)
+      {
+        const auto& from = global_plan[j - 1].pose.position;
+        const auto& to = global_plan[j].pose.position;
+        const double dx = to.x - from.x;
+        const double dy = to.y - from.y;
+        const double segment_length = std::hypot(dx, dy);
+        if (segment_length <= 1e-6)
+          continue;
+
+        const double heading = std::atan2(dy, dx);
+        if (have_previous_heading)
+          accumulated_heading_change += std::abs(g2o::normalize_theta(heading - previous_heading));
+        previous_heading = heading;
+        have_previous_heading = true;
+        probe_length += segment_length;
+      }
+
+      if (accumulated_heading_change > bend_heading_change)
+        max_plan_length = std::max(max_plan_length, bend_lookahead_distance);
     }
     
     geometry_msgs::PoseStamped newer_pose;
     
     double plan_length = 0; // check cumulative Euclidean distance along the plan
+    const int plan_start_idx = i;
+    bool have_first_heading = false;
+    double first_heading = 0.0;
     
     //now we'll transform until points are outside of our distance threshold
     while(i < (int)global_plan.size() && sq_dist <= sq_dist_threshold && (max_plan_length<=0 || plan_length <= max_plan_length))
     {
+      if (max_heading_change > 0.0 && i > plan_start_idx)
+      {
+        const auto& from = global_plan[i-1].pose.position;
+        const auto& to = global_plan[i].pose.position;
+        const double dx = to.x - from.x;
+        const double dy = to.y - from.y;
+        if (std::hypot(dx, dy) > 1e-6)
+        {
+          const double heading = std::atan2(dy, dx);
+          if (have_first_heading && std::abs(g2o::normalize_theta(heading - first_heading)) > max_heading_change)
+            break;
+          if (!have_first_heading)
+          {
+            first_heading = heading;
+            have_first_heading = true;
+          }
+        }
+      }
       const geometry_msgs::PoseStamped& pose = global_plan[i];
       tf2::doTransform(pose, newer_pose, plan_to_global_transform);
 
@@ -773,7 +889,7 @@ bool TebLocalPlannerROS::transformGlobalPlan(const tf2_ros::Buffer& tf, const st
       sq_dist = x_diff * x_diff + y_diff * y_diff;
       
       // caclulate distance to previous pose
-      if (i>0 && max_plan_length>0)
+      if (i>plan_start_idx && max_plan_length>0)
         plan_length += distance_points2d(global_plan[i-1].pose.position, global_plan[i].pose.position);
 
       ++i;
@@ -783,6 +899,11 @@ bool TebLocalPlannerROS::transformGlobalPlan(const tf2_ros::Buffer& tf, const st
     // the resulting transformed plan can be empty. In that case we explicitly inject the global goal.
     if (transformed_plan.empty())
     {
+      if (first_plan_idx >= 0)
+      {
+        ROS_WARN("Ordered global plan is outside the local costmap");
+        return false;
+      }
       tf2::doTransform(global_plan.back(), newer_pose, plan_to_global_transform);
 
       transformed_plan.push_back(newer_pose);
@@ -821,9 +942,33 @@ bool TebLocalPlannerROS::transformGlobalPlan(const tf2_ros::Buffer& tf, const st
   return true;
 }
 
-    
-      
-      
+bool TebLocalPlannerROS::adjustLocalGoalOrientation(base_local_planner::CostmapModel& model,
+                                                    const std::vector<geometry_msgs::Point>& footprint,
+                                                    const geometry_msgs::Point& position, double& yaw,
+                                                    double inscribed_radius, double circumscribed_radius) const
+{
+  if (footprint.size() < 3 || !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(yaw))
+    return false;
+  if (model.footprintCost(position.x, position.y, yaw, footprint, inscribed_radius, circumscribed_radius) >= 0.0)
+    return false;
+
+  constexpr double yaw_step = M_PI / 12.0;
+  for (int step = 1; step <= 6; ++step)
+  {
+    for (int sign : {-1, 1})
+    {
+      const double candidate = g2o::normalize_theta(yaw + sign * step * yaw_step);
+      if (model.footprintCost(position.x, position.y, candidate, footprint,
+                              inscribed_radius, circumscribed_radius) >= 0.0)
+      {
+        yaw = candidate;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 double TebLocalPlannerROS::estimateLocalGoalOrientation(const std::vector<geometry_msgs::PoseStamped>& global_plan, const geometry_msgs::PoseStamped& local_goal,
               int current_goal_idx, const geometry_msgs::TransformStamped& tf_plan_to_global, int moving_average_length) const
 {
@@ -949,7 +1094,7 @@ void TebLocalPlannerROS::configureBackupModes(std::vector<geometry_msgs::PoseSta
     
     // reduced horizon backup mode
     if (cfg_.recovery.shrink_horizon_backup && 
-        goal_idx < (int)transformed_plan.size()-1 && // we do not reduce if the goal is already selected (because the orientation might change -> can introduce oscillations)
+        goal_idx < static_cast<int>(global_plan_.size())-1 && // do not reduce when the global goal is selected
        (no_infeasible_plans_>0 || (current_time - time_last_infeasible_plan_).toSec() < cfg_.recovery.shrink_horizon_min_duration )) // keep short horizon for at least a few seconds
     {
         ROS_INFO_COND(no_infeasible_plans_==1, "Activating reduced horizon backup mode for at least %.2f sec (infeasible trajectory detected).", cfg_.recovery.shrink_horizon_min_duration);
@@ -957,7 +1102,7 @@ void TebLocalPlannerROS::configureBackupModes(std::vector<geometry_msgs::PoseSta
 
         // Shorten horizon if requested
         // reduce to 50 percent:
-        int horizon_reduction = goal_idx/2;
+        int horizon_reduction = static_cast<int>(transformed_plan.size())/2;
         
         if (no_infeasible_plans_ > 9)
         {
@@ -970,8 +1115,8 @@ void TebLocalPlannerROS::configureBackupModes(std::vector<geometry_msgs::PoseSta
         // and a reduced horizon should occur just rarely.
         int new_goal_idx_transformed_plan = int(transformed_plan.size()) - horizon_reduction - 1;
         goal_idx -= horizon_reduction;
-        if (new_goal_idx_transformed_plan>0 && goal_idx >= 0)
-            transformed_plan.erase(transformed_plan.begin()+new_goal_idx_transformed_plan, transformed_plan.end());
+        if (horizon_reduction > 0 && new_goal_idx_transformed_plan>0 && goal_idx >= 0)
+            transformed_plan.erase(transformed_plan.begin()+new_goal_idx_transformed_plan+1, transformed_plan.end());
         else
             goal_idx += horizon_reduction; // this should not happen, but safety first ;-) 
     }
@@ -1217,5 +1362,3 @@ double TebLocalPlannerROS::getNumberFromXMLRPC(XmlRpc::XmlRpcValue& value, const
 }
 
 } // end namespace teb_local_planner
-
-

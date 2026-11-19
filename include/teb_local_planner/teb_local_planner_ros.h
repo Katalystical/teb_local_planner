@@ -315,12 +315,16 @@ protected:
     * @param[out] transformed_plan Populated with the transformed plan
     * @param[out] current_goal_idx Index of the current (local) goal pose in the global plan
     * @param[out] tf_plan_to_global Transformation between the global plan and the global planning frame
+    * @param first_plan_idx Earliest plan index to consider when ordered tracking is enabled
+    * @param max_heading_change Maximum heading change in the local plan, in radians; zero disables it
+    * @param[out] current_start_idx Index of the selected starting pose, if ordered tracking is enabled
     * @return \c true if the global plan is transformed, \c false otherwise
     */
   bool transformGlobalPlan(const tf2_ros::Buffer& tf, const std::vector<geometry_msgs::PoseStamped>& global_plan,
                            const geometry_msgs::PoseStamped& global_pose,  const costmap_2d::Costmap2D& costmap,
                            const std::string& global_frame, double max_plan_length, std::vector<geometry_msgs::PoseStamped>& transformed_plan,
-                           int* current_goal_idx = NULL, geometry_msgs::TransformStamped* tf_plan_to_global = NULL) const;
+                           int* current_goal_idx = NULL, geometry_msgs::TransformStamped* tf_plan_to_global = NULL,
+                           int first_plan_idx = -1, double max_heading_change = 0.0, int* current_start_idx = NULL) const;
     
   /**
     * @brief Estimate the orientation of a pose from the global_plan that is treated as a local goal for the local planner.
@@ -339,6 +343,11 @@ protected:
     */
   double estimateLocalGoalOrientation(const std::vector<geometry_msgs::PoseStamped>& global_plan, const geometry_msgs::PoseStamped& local_goal,
                                       int current_goal_idx, const geometry_msgs::TransformStamped& tf_plan_to_global, int moving_average_length=3) const;
+
+  bool adjustLocalGoalOrientation(base_local_planner::CostmapModel& model,
+                                  const std::vector<geometry_msgs::Point>& footprint,
+                                  const geometry_msgs::Point& position, double& yaw,
+                                  double inscribed_radius, double circumscribed_radius) const;
         
         
   /**
@@ -410,6 +419,9 @@ private:
   FailureDetector failure_detector_; //!< Detect if the robot got stucked
   
   std::vector<geometry_msgs::PoseStamped> global_plan_; //!< Store the current global plan
+  bool ordered_plan_tracking_;
+  double max_plan_heading_change_;
+  int global_plan_start_idx_;
   
   base_local_planner::OdometryHelperRos odom_helper_; //!< Provides an interface to receive the current velocity from the robot
   
@@ -453,5 +465,3 @@ public:
 }; // end namespace teb_local_planner
 
 #endif // TEB_LOCAL_PLANNER_ROS_H_
-
-
